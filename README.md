@@ -1,5 +1,15 @@
 # Chaplin
 
+The purpose of this fork of Amanvir Parhar's Chaplin code is to create a wearable version for people who are unable to speak, but can move their lips (throat cancer survivors, for example). I'm presently building and running this code on a Jetson Orin Nano Developer Kit (a Raspberry Pi is too slow and memory limited), and using a container within it so I could get torch running.
+
+At the moment, this thing isn't even beta - but I'm working on it. If you want something more stable, start with Parhar's code. His code, while excellent, wasn't intended for this type of use. If you have any ideas on how to improve what I'm up to, please drop me a line.
+
+At present, I'm running Jetson as a headless setup. You'll need to SSH in from a Linux or Windows machine to run it (I've run it on both). You'll need TightVnC or something running to see what's going on. 
+
+-Doug
+
+Parhar's comments on the original are below (with minor modifications):
+
 ![Chaplin Thumbnail](./thumbnail.png)
 
 A visual speech recognition (VSR) tool that reads your lips in real-time and types whatever you silently mouth. Runs fully locally.
@@ -12,14 +22,14 @@ Watch a demo of Chaplin [here](https://youtu.be/qlHi0As2alQ).
 
 1. Clone the repository, and `cd` into it:
    ```sh
-   git clone https://github.com/amanvirparhar/chaplin
-   cd chaplin
+   git clone https://github.com/TheDougMiester/chaplin
+   copy the files build_chaplin_env.sh and start_chaplin_container.sh into your $HOME directory 
+   cd $HOME
    ```
-2. Run the setup script...
-   ```sh
-   ./setup.sh
+2. Build the Chaplin environment
+   ./build_chaplin_env.sh
    ```
-   ...which will automatically download the required model files from Hugging Face Hub and place them in the appropriate directories:
+   ...which should download the required model files from Hugging Face Hub and place them in the appropriate directories:
    ```
    chaplin/
    ├── benchmarks/
@@ -35,10 +45,9 @@ Watch a demo of Chaplin [here](https://youtu.be/qlHi0As2alQ).
 
 ## Usage
 
-1. Run the following command:
-   ```sh
-   uv run --with-requirements requirements.txt --python 3.12 main.py config_filename=./configs/LRS3_V_WER19.1.ini detector=mediapipe
-   ```
-2. Once the camera feed is displayed, you can start "recording" by pressing the `option` key (Mac) or the `alt` key (Windows/Linux), and start mouthing words.
-3. To stop recording, press the `option` key (Mac) or the `alt` key (Windows/Linux) again. The raw VSR output will get logged in your terminal, and the LLM-corrected version will be typed at your cursor.
-4. To exit gracefully, focus on the window displaying the camera feed and press `q`.
+1. Run the following command: . $HOME/start_chaplin_container.sh - this will start the Jetson container.
+2. Once in the container, run root@Jetson:/workspace/chaplin# CHAPLIN_VNC=1 MEDIAPIPE_DETECT_EVERY=8 source /workspace/chaplin/run_chaplin_workspace.sh
+3. Once the messages show the camera is running (and the voice says Chaplin is ready), start your VNC viewer on your local machine (TightVNC or whatever)
+4. Once the camera feed is displayed, you can start "recording" by pressing the `option` key (Mac) or the `alt` key (Windows/Linux), and start mouthing words.
+5. To stop recording, press the `option` key (Mac) or the `alt` key (Windows/Linux) again. The raw VSR output will get logged in your terminal, and the LLM-corrected version will be typed at your cursor.
+6. To exit gracefully, focus on the window displaying the camera feed and press `q`.
