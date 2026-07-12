@@ -1,6 +1,6 @@
 # Chaplin
 
-The purpose of this fork of Amanvir Parhar's Chaplin code is to create a wearable version for people who are unable to speak, but can move their lips (throat cancer survivors, for example). I'm presently building and running this code on a Jetson Orin Nano Developer Kit (a Raspberry Pi is too slow and memory limited), and using a container within it so I could get torch running.
+The purpose of this fork of Amanvir Parhar's Chaplin code is to create a wearable version for people who are unable to speak, but can move their lips (throat cancer survivors, for example). I am running the code on a Jetson Orin Nano Developer Kit, running Jet Pack Version: 6.2.2+b24 (a Raspberry Pi is too slow and memory limited). I was using an IMX519 as my camera, mounted on CAM0. Because of issues with torch, I had to create a container using https://github.com/dusty-nv/jetson-containers; I run chaplin within that container.
 
 At the moment, this thing isn't even beta - but I'm working on it. If you want something more stable, start with Parhar's code. His code, while excellent, wasn't intended for this type of use. If you have any ideas on how to improve what I'm up to, please drop me a line.
 
