@@ -1,0 +1,20 @@
+# App offline - uses base
+FROM chaplin:base
+ENV DEBIAN_FRONTEND=noninteractive CUDA_HOME=/usr/local/cuda PATH=/usr/local/cuda/bin:$PATH LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/cuda/targets/aarch64-linux/lib:$LD_LIBRARY_PATH
+RUN apt-get update && apt-get install -y --no-install-recommends python3-libnvinfer python3-libnvinfer-dev gcc xvfb x11vnc && rm -rf /var/lib/apt/lists/*
+
+COPY offline/wheels /tmp/wheels
+COPY offline/torch2trt.tar.gz /tmp/
+RUN mkdir -p /usr/lib/aarch64-linux-gnu/tegra /usr/lib/aarch64-linux-gnu/nvidia && for LIB in libnvdla_compiler.so libnvcudla.so libnvdla_runtime.so; do [ -f /usr/lib/aarch64-linux-gnu/tegra/$LIB ] || printf "void dummy(){}" | gcc -shared -fPIC -x c - -o /usr/lib/aarch64-linux-gnu/tegra/$LIB; ln -sf tegra/$LIB /usr/lib/aarch64-linux-gnu/$LIB; ln -sf ../tegra/$LIB /usr/lib/aarch64-linux-gnu/nvidia/$LIB 2>/dev/null || true; done && ldconfig
+
+RUN mkdir -p /tmp/torch2trt && tar xzf /tmp/torch2trt.tar.gz -C /tmp/torch2trt --strip-components=1 && cd /tmp/torch2trt && sed -i 's/^import tensorrt/try:\n    import tensorrt\nexcept Exception as e:\n    print(f"[BUILD WARN] {e}")\n    class _D:\n        __version__="10.3.0"\n    tensorrt=_D()/' setup.py && pip3 install --no-cache-dir --no-build-isolation . && rm -rf /tmp/torch2trt /tmp/torch2trt.tar.gz
+
+RUN apt-get update && apt-get install -y python3-evdev && rm -rf /var/lib/apt/lists/* && \
+    pip3 install --no-index --find-links=/tmp/wheels --no-cache-dir pycuda hydra-core omegaconf mediapipe==0.10.14 pydantic ollama piper-tts python-xlib scikit-image && \
+    pip3 install --find-links=/tmp/wheels --no-cache-dir av && \
+    pip3 install --no-index --find-links=/tmp/wheels --no-cache-dir --no-deps pynput && \
+    pip3 install --no-index --find-links=/tmp/wheels --force-reinstall --no-cache-dir numpy==1.26.4
+
+RUN ldconfig && python3 -c "import torch, torchvision, torchaudio, cv2; print('FINAL OFFLINE OK', torch.__version__)" && python3 -c "import torch; print('torch2trt will be verified at runtime with real Tegra libs')"
+WORKDIR /workspace
+CMD ["/bin/bash"]

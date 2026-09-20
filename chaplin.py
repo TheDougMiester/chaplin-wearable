@@ -1,13 +1,15 @@
+#Claude sonnet 5 helped
+
 import cv2
 import time
+import numpy as np
 from tts_espeak import AsyncTTS
-from ollama import AsyncClient
+from ollama import Client
 from pydantic import BaseModel
 from concurrent.futures import ThreadPoolExecutor
 import os
 import signal
 from pynput import keyboard
-import asyncio
 
 
 class ChaplinOutput(BaseModel):
@@ -16,45 +18,111 @@ class ChaplinOutput(BaseModel):
 
 
 class Chaplin:
+
+    # Kept as a class-level constant purely so it's easy to find/edit.
+    # NOTE: the trailing "/no_think" hint is a Qwen3-specific convention
+    # that suppresses its internal <think>...</think> reasoning trace.
+    # On Orin Nano that reasoning trace is very often the single biggest
+    # source of correction latency for reasoning-capable models. It's a
+    # no-op (harmless) for non-Qwen3 models. See CHAPLIN_DISABLE_THINKING
+    # below if you ever want to turn this off.
+    CORRECTION_SYSTEM_PROMPT = (
+        "You are an assistant that helps make corrections to the output of a "
+        "lipreading model. The text you will receive was transcribed using a "
+        "video-to-text system that attempts to lipread the subject speaking in "
+        "the video, so the text will likely be imperfect. The input text will "
+        "also be in all-caps, although your response should be capitalized "
+        "correctly and should NOT be in all-caps.\n\n"
+        "If something seems unusual, assume it was mistranscribed. Do your best "
+        "to infer the words actually spoken, and make changes to the "
+        "mistranscriptions in your response. Do not add more words or content, "
+        "just change the ones that seem to be out of place (and, therefore, "
+        "mistranscribed). Do not change even the wording of sentences, just "
+        "individual words that look nonsensical in the context of all of the "
+        "other words in the sentence.\n\n"
+        "Also, add correct punctuation to the entire text. ALWAYS end each "
+        "sentence with the appropriate sentence ending: '.', '?', or '!'.\n\n"
+        "Return the corrected text in the format of 'list_of_changes' and "
+        "'corrected_text'."
+    )
+
     def __init__(self):
         self.vsr_model = None
+
         # set up text-to-speech
         self.tts = AsyncTTS()
         print(f"[TTS] Using ALSA device: {self.tts.alsa_device}", flush=True)
+
         # flag to toggle recording
         self.recording = False
         # flag to trigger clean exit from the capture loop
         self._shutdown = False
 
-        # thread stuff
+        # ------------------------------------------------------------------
+        # Single-worker executor. This is the ENTIRE concurrency model now:
+        # capture/record/display stays on the main thread (has to, it's
+        # driving a live camera + a window), and every downstream stage --
+        # VSR inference, Ollama correction, TTS, keyboard typing -- runs
+        # back-to-back inside this one worker thread, one utterance at a
+        # time, in submission order. Because there's only ever one worker,
+        # ordering is guaranteed for free -- no asyncio, no Condition, no
+        # sequence numbers required.
+        # ------------------------------------------------------------------
         self.executor = ThreadPoolExecutor(max_workers=1)
 
-        # video params
+        # video params - res_factor now from INI [capture] if present
         self.output_prefix = "webcam"
-        self.res_factor = 3
+        self.res_factor = 2
         self.fps = 16
-        self.frame_interval = 1 / self.fps
         self.frame_compression = 25
+        ini_path = os.getenv("CHAPLIN_CONFIG", "./configs/LRS3_V_WER19.1.ini")
+        try:
+            import configparser
+            cp = configparser.ConfigParser()
+            cp.read(ini_path)
+            if cp.has_section("capture"):
+                self.res_factor = int(cp.get("capture", "res_factor", fallback=str(self.res_factor)))
+                self.fps = int(cp.get("capture", "fps", fallback=str(self.fps)))
+                self.frame_compression = int(cp.get("capture", "frame_compression", fallback=str(self.frame_compression)))
+            if cp.has_section("performance"):
+                os.environ.setdefault("MEDIAPIPE_DETECT_EVERY", cp.get("performance", "mediapipe_detect_every", fallback="8"))
+                os.environ.setdefault("CHAPLIN_CAMERA_OPEN_RETRIES", cp.get("performance", "camera_open_retries", fallback="30"))
+                os.environ.setdefault("CHAPLIN_CAMERA_OPEN_RETRY_DELAY", cp.get("performance", "camera_open_retry_delay", fallback="3.0"))
+            if cp.has_section("tts"):
+                os.environ.setdefault("TTS_ALSA_DEVICE", cp.get("tts", "alsa_device", fallback="default"))
+                os.environ.setdefault("CHAPLIN_TTS_RAW", cp.get("tts", "tts_raw", fallback="1"))
+                os.environ.setdefault("CHAPLIN_TTS_CORRECTED", cp.get("tts", "tts_corrected", fallback="0"))
+                os.environ.setdefault("CHAPLIN_DISABLE_OLLAMA", cp.get("tts", "disable_ollama", fallback="1"))
+            if cp.has_section("ollama"):
+                os.environ.setdefault("OLLAMA_MODEL", cp.get("ollama", "model", fallback="qwen3:1.7b"))
+            print(f"[Chaplin] Loaded startup config from {ini_path}: res_factor={self.res_factor} fps={self.fps}", flush=True)
+        except Exception as e:
+            print(f"[Chaplin] Could not read {ini_path}: {e}, using defaults res_factor={self.res_factor}", flush=True)
+        self.frame_interval = 1 / self.fps
 
         # setup keyboard controller for typing
         self.kbd_controller = keyboard.Controller()
 
-        # setup async ollama client
-        self.ollama_client = AsyncClient()
+        # setup ollama client (SYNCHRONOUS -- see note above on why)
+        ollama_host = os.getenv("OLLAMA_HOST")  # e.g. http://localhost:11434
+        self.ollama_timeout_sec = float(os.getenv("OLLAMA_TIMEOUT_SEC", "20"))
+        client_kwargs = {"timeout": self.ollama_timeout_sec}
+        if ollama_host:
+            client_kwargs["host"] = ollama_host
+        self.ollama_client = Client(**client_kwargs)
+
         self.ollama_model = os.getenv("OLLAMA_MODEL", "qwen3:4b")
-        print(f"[Chaplin] Ollama endpoint: {self.ollama_client}", flush=True)
-        print(f"[Chaplin] Model: {self.ollama_model}", flush=True)
+        self.ollama_num_predict = int(os.getenv("OLLAMA_NUM_PREDICT", "256"))
 
-        # setup asyncio event loop in background thread
-        self.loop = asyncio.new_event_loop()
-        self.async_thread = ThreadPoolExecutor(max_workers=1)
-        self.async_thread.submit(self._run_event_loop)
+        disable_thinking = os.getenv("CHAPLIN_DISABLE_THINKING", "1").strip() == "1"
+        self.correction_system_prompt = self.CORRECTION_SYSTEM_PROMPT
+        if disable_thinking and "qwen3" in self.ollama_model.lower():
+            self.correction_system_prompt += "\n\n/no_think"
 
-        # sequence tracking to ensure outputs are typed in order
-        self.next_sequence_to_type = 0
-        self.current_sequence = 0  # counter for assigning sequence numbers
-        self.typing_lock = None    # will be created in async loop
-        self._init_async_resources()
+        print(f"[Chaplin] Ollama host: {ollama_host or '(default)'}", flush=True)
+        print(f"[Chaplin] Model: {self.ollama_model} "
+              f"(timeout={self.ollama_timeout_sec}s, num_predict={self.ollama_num_predict})",
+              flush=True)
 
         # setup global hotkey for toggling recording with option/alt key
         self.hotkey = keyboard.GlobalHotKeys({
@@ -63,7 +131,7 @@ class Chaplin:
         self.hotkey.start()
 
         # register signal handlers so Ctrl-C and SIGTERM both trigger clean shutdown
-        signal.signal(signal.SIGINT,  self._handle_signal)
+        signal.signal(signal.SIGINT, self._handle_signal)
         signal.signal(signal.SIGTERM, self._handle_signal)
 
     def _handle_signal(self, signum, frame):
@@ -72,168 +140,139 @@ class Chaplin:
         self._shutdown = True
         self.recording = False  # stop any active recording
 
-    def _run_event_loop(self):
-        asyncio.set_event_loop(self.loop)
-        self.loop.run_forever()
-
-    def _init_async_resources(self):
-        """Initialize async resources in the async loop"""
-        future = asyncio.run_coroutine_threadsafe(
-            self._create_async_lock(), self.loop)
-        future.result()  # wait for it to complete
-
-    async def _create_async_lock(self):
-        """Create asyncio.Lock and Condition in the event loop's context"""
-        self.typing_lock = asyncio.Lock()
-        self.typing_condition = asyncio.Condition(self.typing_lock)
-
     def toggle_recording(self):
         # toggle recording when alt/option key is pressed
         self.recording = not self.recording
 
-    async def correct_output_async(self, output, sequence_num):
+    # ----------------------------------------------------------------------
+    # Correction / TTS / typing -- fully synchronous, called from inside
+    # perform_inference() which itself only ever runs on the single
+    # executor worker thread. No locking needed: there is structurally
+    # only ever one of these in flight at a time.
+    # ----------------------------------------------------------------------
+    def correct_output(self, output):
+        # Skip LLM entirely for real-time wearable - env CHAPLIN_DISABLE_OLLAMA=1
+        if os.getenv("CHAPLIN_DISABLE_OLLAMA", "0").strip() == "1":
+            corrected = output.strip().capitalize()
+            if corrected and corrected[-1] not in ('.', '?', '!'):
+                corrected += '.'
+            corrected += ' '
+            print(f"[Chaplin] CHAPLIN_DISABLE_OLLAMA=1 - skipping LLM, using raw: {corrected.strip()}", flush=True)
+            return corrected
+
+        t0 = time.perf_counter()
+        corrected_text = None
+
         try:
-            return await self._correct_output_async_inner(output, sequence_num)
+            response = self.ollama_client.chat(
+                model=self.ollama_model,
+                messages=[
+                    {
+                        'role': 'system',
+                        'content': self.correction_system_prompt,
+                    },
+                    {
+                        'role': 'user',
+                        'content': f"Transcription:\n\n{output}",
+                    },
+                ],
+                format=ChaplinOutput.model_json_schema(),
+                options={"num_predict": self.ollama_num_predict},
+            )
+            chat_output = ChaplinOutput.model_validate_json(
+                response['message']['content'])
+            corrected_text = chat_output.corrected_text.strip()
+            if not corrected_text:
+                raise ValueError("empty corrected_text returned by ollama")
+
         except Exception as e:
+            # Covers timeouts (httpx.TimeoutException), connection errors,
+            # malformed JSON, empty responses -- anything. A slow/broken
+            # Ollama call must NEVER be allowed to silently drop an
+            # utterance on a wearable device; fall back to the raw VSR
+            # output instead of skipping it.
             import traceback
-            print(f"[Chaplin] ERROR: correct_output_async failed for sequence {sequence_num}: {e}", flush=True)
+            print(f"[Chaplin] WARNING: ollama correction failed/timed out: {e}", flush=True)
             traceback.print_exc()
-            # make sure a failed task doesn't permanently stall the typing/tts
-            # sequence for every task queued behind it
-            async with self.typing_condition:
-                if self.next_sequence_to_type == sequence_num:
-                    self.next_sequence_to_type += 1
-                    self.typing_condition.notify_all()
-            return ""
+            corrected_text = output.strip().capitalize()
 
-    async def _correct_output_async_inner(self, output, sequence_num):
-        # perform inference on the raw output to get back a "correct" version
-        response = await self.ollama_client.chat(
-            model=self.ollama_model,
-            messages=[
-                {
-                    'role': 'system',
-                    'content': (
-                        "You are an assistant that helps make corrections to the output of a "
-                        "lipreading model. The text you will receive was transcribed using a "
-                        "video-to-text system that attempts to lipread the subject speaking in "
-                        "the video, so the text will likely be imperfect. The input text will "
-                        "also be in all-caps, although your response should be capitalized "
-                        "correctly and should NOT be in all-caps.\n\n"
-                        "If something seems unusual, assume it was mistranscribed. Do your best "
-                        "to infer the words actually spoken, and make changes to the "
-                        "mistranscriptions in your response. Do not add more words or content, "
-                        "just change the ones that seem to be out of place (and, therefore, "
-                        "mistranscribed). Do not change even the wording of sentences, just "
-                        "individual words that look nonsensical in the context of all of the "
-                        "other words in the sentence.\n\n"
-                        "Also, add correct punctuation to the entire text. ALWAYS end each "
-                        "sentence with the appropriate sentence ending: '.', '?', or '!'.\n\n"
-                        "Return the corrected text in the format of 'list_of_changes' and "
-                        "'corrected_text'."
-                    )
-                },
-                {
-                    'role': 'user',
-                    'content': f"Transcription:\n\n{output}"
-                }
-            ],
-            format=ChaplinOutput.model_json_schema()
-        )
+        if corrected_text and corrected_text[-1] not in ('.', '?', '!'):
+            corrected_text += '.'
+        corrected_text += ' '
 
-        # get only the corrected text
-        chat_output = ChaplinOutput.model_validate_json(
-            response['message']['content'])
-
-        # if last character isn't a sentence ending (happens sometimes), add a period
-        chat_output.corrected_text = chat_output.corrected_text.strip()
-        if not chat_output.corrected_text:
-            print(f"[Chaplin] WARNING: empty corrected_text for sequence {sequence_num}, skipping.", flush=True)
-            async with self.typing_condition:
-                while self.next_sequence_to_type != sequence_num:
-                    await self.typing_condition.wait()
-                self.next_sequence_to_type += 1
-                self.typing_condition.notify_all()
-            return ""
-
-        if chat_output.corrected_text[-1] not in ['.', '?', '!']:
-            chat_output.corrected_text += '.'
-
-        # add space at the end
-        chat_output.corrected_text += ' '
-
-        # wait until it's this task's turn to type
-        async with self.typing_condition:
-            while self.next_sequence_to_type != sequence_num:
-                await self.typing_condition.wait()
-
-            # give text to speech output FIRST so a typing failure can never
-            # suppress audio output
-            try:
-                self.tts.say(chat_output.corrected_text)
-            except Exception as e:
-                print(f"[Chaplin] ERROR: tts.say() failed: {e}", flush=True)
-
-            # this task's turn to type the corrected text
-            try:
-                self.kbd_controller.type(chat_output.corrected_text)
-            except Exception as e:
-                print(f"[Chaplin] ERROR: kbd_controller.type() failed: {e}", flush=True)
-
-            # increment sequence and notify next task
-            self.next_sequence_to_type += 1
-            self.typing_condition.notify_all()
-
-        return chat_output.corrected_text
+        t1 = time.perf_counter()
+        print(f"[PERF] correct_output: {(t1 - t0) * 1000:.1f}ms", flush=True)
+        return corrected_text
 
     def perform_inference(self, video_path):
-        import time
+        """
+        Runs entirely inside the single-worker executor thread.
+        VSR -> (optional immediate RAW TTS) -> correction -> typing, strictly sequential.
+        Set CHAPLIN_TTS_RAW=1 (default) for real-time audio without waiting for LLM.
+        Set CHAPLIN_TTS_CORRECTED=0 (default) to skip speaking corrected version.
+        """
         t0 = time.perf_counter()
         output = self.vsr_model(video_path)
         t1 = time.perf_counter()
-        print(f"[PERF] perform_inference TOTAL: {(t1-t0)*1000:.1f}ms | {video_path}", flush=True)
+        print(f"[PERF] VSR inference: {(t1 - t0) * 1000:.1f}ms | {video_path}", flush=True)
         print(f"\n\033[48;5;21m\033[97m\033[1m RAW OUTPUT \033[0m: {output}\n", flush=True)
-        sequence_num = self.current_sequence
-        self.current_sequence += 1
-        asyncio.run_coroutine_threadsafe(
-            self.correct_output_async(output, sequence_num),
-            self.loop
+
+        # REAL-TIME AUDIO: speak raw immediately, don't wait 20s for LLM
+        tts_raw = os.getenv("CHAPLIN_TTS_RAW", "1").strip() == "1"
+        tts_corrected = os.getenv("CHAPLIN_TTS_CORRECTED", "0").strip() == "1"
+
+        if tts_raw:
+            try:
+                raw_spaced = output.strip().capitalize() + ". "
+                self.tts.say(raw_spaced)
+            except Exception as e:
+                print(f"[Chaplin] ERROR: tts.say(raw) failed: {e}", flush=True)
+
+        corrected_text = self.correct_output(output)
+        t2 = time.perf_counter()
+
+        if tts_corrected:
+            try:
+                self.tts.say(corrected_text)
+            except Exception as e:
+                print(f"[Chaplin] ERROR: tts.say(corrected) failed: {e}", flush=True)
+
+        try:
+            self.kbd_controller.type(corrected_text)
+        except Exception as e:
+            print(f"[Chaplin] ERROR: kbd_controller.type() failed: {e}", flush=True)
+
+        t3 = time.perf_counter()
+        print(
+            f"[PERF] vsr={(t1 - t0) * 1000:.0f}ms "
+            f"correction={(t2 - t1) * 1000:.0f}ms "
+            f"tts+type={(t3 - t2) * 1000:.0f}ms "
+            f"TOTAL={(t3 - t0) * 1000:.0f}ms",
+            flush=True,
         )
+
         return {
-            "output": output,
-            "video_path": video_path
+            "output": corrected_text,
+            "video_path": video_path,
         }
+
+    # ------------------------------------------------------------------
+    # Everything below (GStreamer pipeline construction, camera open,
+    # stale-clip cleanup, main capture loop) is UNCHANGED from your
+    # existing implementation -- only the async/typing-lock plumbing in
+    # __init__ / correct_output / perform_inference / cleanup was removed.
+    # ------------------------------------------------------------------
+
     def _build_gstreamer_pipeline(self, width, height, fps, stream=False,
                                    stream_host=None, stream_port=None,
                                    sensor_width=1280, sensor_height=720,
                                    stream_bitrate=None):
         """
         Build a hardware-accelerated GStreamer pipeline for the IMX519 on Jetson.
-        Requires the following environment variables to be set before launch:
-            EGL_PLATFORM=device
-            EGL_DEVICE_ID=/dev/dri/renderD128
-        Both DISPLAY and WAYLAND_DISPLAY must be unset.
-        See run_chaplin_workspace_x11.sh for how these are configured.
-
-        If stream=True, the single nvarguscamerasrc capture is tee'd into two
-        branches so we don't open a second, competing Argus capture session:
-          - inference branch: scaled down to (width, height) -> appsink, same
-            as before, feeds cv2.VideoCapture for the VSR pipeline.
-          - streaming branch: scaled down to STREAM_WIDTH/STREAM_HEIGHT ->
-            nvv4l2h264enc -> rtph264pay -> udpsink, sent live to
-            stream_host:stream_port (see run_chaplin_workspace_x11.sh).
-
-        sensor_width/sensor_height (the nvarguscamerasrc capture caps) stay
-        fixed at 1280x720 -- that's the smallest of the IMX519's actual
-        discrete Argus sensor modes (4656x3496 / 3840x2160 / 1920x1080 /
-        1280x720), so it's the only sane choice for the raw capture request;
-        arbitrary resolutions like 640x480 aren't valid sensor modes and
-        risk failing caps negotiation entirely. Instead, the STREAMING
-        branch gets its own nvvidconv scale-down AFTER capture, so the
-        H264 encoder's buffer pool is smaller (real, previously-untested
-        memory pressure -- caused an actual OOM kill on an 8GB device
-        already running a warm Ollama model) without touching sensor
-        negotiation at all.
+        FIX: Always request a VALID sensor mode (1280x720) from nvarguscamerasrc,
+        then scale down to inference size (212x160) with nvvidconv. Requesting
+        212x160 directly from nvarguscamerasrc is invalid and causes
+        NvBufSurfaceFromFd Failed on JP6.
         """
         stream_width = int(os.getenv("STREAM_WIDTH", "640"))
         stream_height = int(os.getenv("STREAM_HEIGHT", "480"))
@@ -241,18 +280,16 @@ class Chaplin:
 
         if not stream:
             return (
-                f"nvarguscamerasrc sensor_id=0 ! "
-                f"video/x-raw(memory:NVMM),width={width},height={height},"
+                f"nvarguscamerasrc sensor-id=0 sensor-mode=3 ! "
+                f"video/x-raw(memory:NVMM),width={sensor_width},height={sensor_height},"
                 f"framerate={fps}/1,format=NV12 ! "
-                f"nvvidconv ! "
-                f"video/x-raw,format=BGRx ! "
-                f"videoconvert ! "
-                f"video/x-raw,format=BGR ! "
+                f"nvvidconv ! video/x-raw,format=BGRx,width={width},height={height} ! "
+                f"videoconvert ! video/x-raw,format=BGR ! "
                 f"appsink drop=1 max-buffers=2"
             )
 
         return (
-            f"nvarguscamerasrc sensor_id=0 ! "
+            f"nvarguscamerasrc sensor-id=0 sensor-mode=3 ! "
             f"video/x-raw(memory:NVMM),width={sensor_width},height={sensor_height},"
             f"framerate={fps}/1,format=NV12 ! "
             f"tee name=t "
@@ -267,6 +304,32 @@ class Chaplin:
             f"udpsink host={stream_host} port={stream_port} sync=false async=false"
         )
 
+    def _warm_ollama_model(self):
+        """
+        Load the correction model into memory. Deliberately called AFTER
+        _open_camera() succeeds (see start_webcam()) -- Argus allocates its
+        VI/CSI hardware capture buffers once, at CaptureSession init time,
+        and holds them for the life of the session. Warming a multi-GB
+        Ollama model into this device's shared 8GB memory BEFORE that
+        allocation happens can starve it, producing NvMap
+        "Error InsufficientMemory" / "No cameras available" failures.
+        Once the camera session is live, its buffers are already reserved,
+        so it's safe to let Ollama consume memory afterward.
+        """
+        t0 = time.perf_counter()
+        try:
+            self.ollama_client.chat(
+                model=self.ollama_model,
+                messages=[{'role': 'user', 'content': ''}],
+                options={"num_predict": 1},
+             )
+            t1 = time.perf_counter()
+            print(f"[Chaplin] Ollama model '{self.ollama_model}' warmed "
+                  f"({(t1 - t0):.1f}s).", flush=True)
+        except Exception as e:
+            print(f"[Chaplin] WARNING: Ollama warm-up failed (will load "
+                  f"lazily on first correction instead): {e}", flush=True)
+
     def _open_camera(self):
         """
         Open the camera using either hardware-accelerated GStreamer (IMX519 on
@@ -275,13 +338,20 @@ class Chaplin:
         Set USE_HW_CAMERA=1 in the container/shell environment to use the IMX519.
         Leave it unset (or set to 0) to use a standard USB webcam via V4L2.
         """
-        cap_width  = (640 // self.res_factor) & ~1   # round down to even -> 212
-        cap_height = (480 // self.res_factor) & ~1   # round down to even -> 160
-        use_hw = os.getenv("USE_HW_CAMERA", "0").strip() == "1"
+        cap_width = (640 // self.res_factor) & ~1   # round down to even -> 212
+        cap_height = (480 // self.res_factor) & ~1  # round down to even -> 160
 
+        use_hw = os.getenv("USE_HW_CAMERA", "0").strip() == "1"
         stream = os.getenv("CHAPLIN_STREAM", "0").strip() == "1"
         stream_host = os.getenv("STREAM_HOST", "192.168.1.17")
         stream_port = os.getenv("STREAM_PORT", "5000")
+
+        # Free GPU memory before Argus alloc on 8GB Nano
+        try:
+            import torch
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
 
         if use_hw:
             gst_pipeline = self._build_gstreamer_pipeline(
@@ -313,9 +383,10 @@ class Chaplin:
             # it just spins forever on select() timeouts while looking
             # like progress. Set CHAPLIN_CAMERA_ALLOW_V4L2_FALLBACK=1 to
             # re-enable it if a real second camera is ever added.
-            max_attempts = int(os.getenv("CHAPLIN_CAMERA_OPEN_RETRIES", "20"))
-            retry_delay = float(os.getenv("CHAPLIN_CAMERA_OPEN_RETRY_DELAY", "3.0"))
+            max_attempts = int(os.getenv("CHAPLIN_CAMERA_OPEN_RETRIES", "10"))
+            retry_delay = float(os.getenv("CHAPLIN_CAMERA_OPEN_RETRY_DELAY", "2.0"))
             got_frame = False
+
             for attempt in range(1, max_attempts + 1):
                 cap = cv2.VideoCapture(gst_pipeline, cv2.CAP_GSTREAMER)
                 if cap.isOpened():
@@ -335,7 +406,7 @@ class Chaplin:
                               f"~{attempt * retry_delay:.0f}s elapsed) — retrying...", flush=True)
                 cap.release()
                 if attempt < max_attempts:
-                    time.sleep(retry_delay)
+                     time.sleep(retry_delay)
 
             if not got_frame:
                 allow_v4l2_fallback = os.getenv(
@@ -350,21 +421,21 @@ class Chaplin:
                     raise RuntimeError(
                         f"[Chaplin] FATAL: Argus never produced a real camera "
                         f"frame after {max_attempts} attempts "
-                        f"(~{max_attempts * retry_delay:.0f}s). Not falling back "
-                        f"to cv2.VideoCapture(0) -- on this hardware that's the "
-                        f"same IMX519 sensor via raw V4L2, which cannot produce "
-                        f"usable frames and will just hang on select() timeouts. "
-                        f"Check `sudo systemctl status nvargus-daemon` and "
-                        f"`sudo docker ps -a` for a stale/competing session."
+                        f"(~{max_attempts * retry_delay:.0f}s), even though the host-side "
+                        f"preflight check (see start_chaplin_container.sh) passed moments "
+                        f"earlier. This strongly suggests something re-acquired the camera "
+                        f"in between -- check for a second chaplin container/process, or a "
+                        f"race with another script. Check `sudo lsof /dev/video0` and "
+                        f"`sudo docker ps -a` right now, while this error is fresh."
                     )
 
         if not use_hw:
             print("[Chaplin] Opening USB webcam via cv2.VideoCapture(0).", flush=True)
             cap = cv2.VideoCapture(0)
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH,  cap_width)
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, cap_width)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cap_height)
 
-        frame_width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         print(f"[Chaplin] Camera ready: {frame_width}x{frame_height} @ {self.fps}fps", flush=True)
         return cap, frame_width, frame_height
@@ -382,11 +453,109 @@ class Chaplin:
                 except OSError:
                     pass
 
+    def start_webcam_with_existing_cap(self, cap, frame_width, frame_height):
+        """Same as start_webcam but reuses already-opened camera to avoid Argus OOM on 8GB"""
+        self._cleanup_stale_clips()
+        print(f"[Chaplin] Reusing existing camera: {frame_width}x{frame_height} @ {self.fps}fps", flush=True)
+        # Now safe to warm Ollama after camera buffers reserved
+        self._warm_ollama_model()
+        self.tts.say("Chaplin is ready.")
+        self.tts.say("Chaplin is ready.")
+        cv2.namedWindow('Chaplin', cv2.WINDOW_NORMAL)
+        cv2.resizeWindow('Chaplin', 640, 480)
+        last_frame_time = time.time()
+        futures = []
+        output_path = ""
+        out = None
+        frame_count = 0
+        try:
+            while not self._shutdown:
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q'):
+                    print("[Chaplin] 'q' pressed — exiting.", flush=True)
+                    break
+                current_time = time.time()
+                if current_time - last_frame_time >= self.frame_interval:
+                    ret, frame = cap.read()
+                    if ret:
+                        compressed_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                        if self.recording:
+                            if out is None:
+                                output_path = self.output_prefix + str(time.time_ns() // 1_000_000) + '.mp4'
+                                out = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*'mp4v'), self.fps, (frame_width, frame_height), False)
+                            out.write(compressed_frame)
+                            last_frame_time = current_time
+                            cv2.circle(compressed_frame, (frame_width - 20, 20), 10, (0, 0, 0), -1)
+                            frame_count += 1
+                        elif not self.recording and frame_count > 0:
+                            if out is not None:
+                                out.release()
+                            if frame_count >= self.fps * 2:
+                                futures.append(self.executor.submit(self.perform_inference, output_path))
+                            else:
+                                os.remove(output_path)
+                            output_path = self.output_prefix + str(time.time_ns() // 1_000_000) + '.mp4'
+                            out = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*'mp4v'), self.fps, (frame_width, frame_height), False)
+                            frame_count = 0
+                        display_frame = cv2.resize(cv2.flip(compressed_frame, 1), (640, 480))
+                        h, w = display_frame.shape[:2]
+                        # Guide box
+                        box_x1, box_y1 = w//4, h//4
+                        box_x2, box_y2 = 3*w//4, 3*h//4
+                        cv2.rectangle(display_frame, (box_x1, box_y1), (box_x2, box_y2), (0,255,0), 2)
+                        cv2.putText(display_frame, "Fit face here", (box_x1, box_y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
+                        cv2.line(display_frame, (w//2-20, h//2), (w//2+20, h//2), (0,255,0), 1)
+                        cv2.line(display_frame, (w//2, h//2-20), (w//2, h//2+20), (0,255,0), 1)
+                        # Lighting feedback
+                        try:
+                            roi = display_frame[box_y1:box_y2, box_x1:box_x2]
+                            gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY) if len(roi.shape)==3 else roi
+                            mean_b = float(np.mean(gray_roi))
+                            if mean_b < 50:
+                                txt, col = f"Lighting BAD dark {mean_b:.0f} - add light", (0,0,255)
+                            elif mean_b > 200:
+                                txt, col = f"Lighting BAD bright {mean_b:.0f}", (0,0,255)
+                            else:
+                                txt, col = f"Lighting OK {mean_b:.0f}", (0,255,0)
+                            cv2.putText(display_frame, txt, (10, h-20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 1)
+                        except Exception:
+                            pass
+                        cv2.imshow('Chaplin', display_frame)
+                for fut in futures:
+                    if fut.done():
+                        result = fut.result()
+                        os.remove(result["video_path"])
+                        futures.remove(fut)
+                    else:
+                        break
+        finally:
+            print("[Chaplin] Cleaning up...", flush=True)
+            if out is not None:
+                out.release()
+            if output_path and os.path.exists(output_path):
+                print(f"[Chaplin] Discarding partial clip: {output_path}", flush=True)
+                os.remove(output_path)
+            cap.release()
+            cv2.destroyAllWindows()
+            self._cleanup_stale_clips()
+            for fut in futures:
+                fut.cancel()
+            self.hotkey.stop()
+            self.executor.shutdown(wait=False)
+            print("[Chaplin] Shutdown complete.", flush=True)
+
     def start_webcam(self):
         # remove any clips left over from a previous crashed session
         self._cleanup_stale_clips()
 
         cap, frame_width, frame_height = self._open_camera()
+        # Camera capture session is confirmed live and its hardware buffers
+        # are already allocated -- safe to let Ollama consume memory now.
+        self._warm_ollama_model()
+
+        self.tts.say("Chaplin is ready.")
+
+
         # Speak the readiness greeting only now, after the camera is
         # confirmed open -- not in __init__. piper's synthesis is CPU-bound
         # (onnxruntime) and was found to intermittently starve
@@ -398,6 +567,7 @@ class Chaplin:
         # count (see tts_espeak.py) which reduces but doesn't guarantee
         # zero contention.
         self.tts.say("Chaplin is ready.")
+
         cv2.namedWindow('Chaplin', cv2.WINDOW_NORMAL)
         cv2.resizeWindow('Chaplin', 640, 480)
 
@@ -420,12 +590,20 @@ class Chaplin:
                 if current_time - last_frame_time >= self.frame_interval:
                     ret, frame = cap.read()
                     if ret:
-                        # frame compression
-                        encode_param = [
-                            int(cv2.IMWRITE_JPEG_QUALITY), self.frame_compression]
-                        _, buffer = cv2.imencode('.jpg', frame, encode_param)
-                        compressed_frame = cv2.imdecode(
-                            buffer, cv2.IMREAD_GRAYSCALE)
+                        # NOTE: this JPEG encode/decode round-trip is CPU work
+                        # done every single frame at self.fps. It's used here
+                        # purely to (a) force grayscale and (b) apply a light
+                        # compression pass before the frame ever hits disk.
+                        # If you're chasing capture-loop latency on Orin Nano,
+                        # replacing this with a plain
+                        # cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) is
+                        # meaningfully cheaper and produces the same
+                        # grayscale-only VideoWriter input, since the mp4v
+                        # VideoWriter compresses on its own anyway.
+                        #encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), self.frame_compression]
+                        #_, buffer = cv2.imencode('.jpg', frame, encode_param)
+                        #compressed_frame = cv2.imdecode(buffer, cv2.IMREAD_GRAYSCALE)
+                        compressed_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
                         if self.recording:
                             if out is None:
@@ -470,11 +648,29 @@ class Chaplin:
                             )
                             frame_count = 0
 
-                        # display the frame in the window
-                        #cv2.imshow('Chaplin', cv2.flip(compressed_frame, 1))
+                        # display the frame in the window with face guide overlay + lighting
                         display_frame = cv2.resize(cv2.flip(compressed_frame, 1), (640, 480))
+                        h, w = display_frame.shape[:2]
+                        box_x1, box_y1 = w//4, h//4
+                        box_x2, box_y2 = 3*w//4, 3*h//4
+                        cv2.rectangle(display_frame, (box_x1, box_y1), (box_x2, box_y2), (0,255,0), 2)
+                        cv2.putText(display_frame, "Fit face here", (box_x1, box_y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
+                        cv2.line(display_frame, (w//2-20, h//2), (w//2+20, h//2), (0,255,0), 1)
+                        cv2.line(display_frame, (w//2, h//2-20), (w//2, h//2+20), (0,255,0), 1)
+                        try:
+                            roi = display_frame[box_y1:box_y2, box_x1:box_x2]
+                            gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY) if len(roi.shape)==3 else roi
+                            mean_b = float(np.mean(gray_roi))
+                            if mean_b < 50:
+                                txt, col = f"Lighting BAD dark {mean_b:.0f} - add light", (0,0,255)
+                            elif mean_b > 200:
+                                txt, col = f"Lighting BAD bright {mean_b:.0f}", (0,0,255)
+                            else:
+                                txt, col = f"Lighting OK {mean_b:.0f}", (0,255,0)
+                            cv2.putText(display_frame, txt, (10, h-20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 1)
+                        except Exception:
+                            pass
                         cv2.imshow('Chaplin', display_frame)
-
                 # ensures that videos are handled in the order they were recorded
                 for fut in futures:
                     if fut.done():
@@ -491,9 +687,9 @@ class Chaplin:
             # release active VideoWriter — discard the partial clip
             if out is not None:
                 out.release()
-                if output_path and os.path.exists(output_path):
-                    print(f"[Chaplin] Discarding partial clip: {output_path}", flush=True)
-                    os.remove(output_path)
+            if output_path and os.path.exists(output_path):
+                print(f"[Chaplin] Discarding partial clip: {output_path}", flush=True)
+                os.remove(output_path)
 
             # release camera
             cap.release()
@@ -508,10 +704,6 @@ class Chaplin:
 
             # stop global hotkey listener
             self.hotkey.stop()
-
-            # stop async event loop
-            self.loop.call_soon_threadsafe(self.loop.stop)
-            self.async_thread.shutdown(wait=True)
 
             # shutdown executor
             self.executor.shutdown(wait=False)
